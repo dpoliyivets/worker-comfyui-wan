@@ -1,8 +1,12 @@
-# ComfyUI Refinement Worker for RunPod Serverless
-# CUDA 12.4 (compatible with RunPod us-il-1 driver 550.127.05)
-# Single venv approach — no comfy-cli, no dual venv conflict
-
-ARG BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+# ComfyUI Wan2.2 Worker for RunPod Serverless
+# Ubuntu 24.04 base ships Python 3.12 natively, so we don't need the
+# deadsnakes PPA (which kept failing during builds — dbus chain hang,
+# keyserver timeout, then 503 from Launchpad's CDN). NVIDIA hasn't
+# published cudnn-runtime images for Ubuntu 24.04 below CUDA 12.6, so we
+# pick the lowest stable 12.6.x. PyTorch's cu124 wheel still works against
+# a 12.6 runtime — driver-level forward compat handles the difference, and
+# PyTorch bundles its own CUDA libs.
+ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -34,21 +38,10 @@ ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
-# Add deadsnakes PPA for Python 3.12 (not available natively on Ubuntu 22.04).
-# Two non-obvious choices baked in here:
-#
-# 1. We avoid `software-properties-common` (which provides add-apt-repository)
-#    because it pulls in dbus/packagekit/networkd-dispatcher whose post-install
-#    machinery breaks non-interactive Docker builds.
-#
-# 2. We use `[trusted=yes]` instead of fetching the GPG key, because RunPod's
-#    build environment can't reach keyserver.ubuntu.com (connection times out
-#    after 3.5 min). Transport is still HTTPS to Launchpad; we just skip the
-#    cryptographic verification of the package signatures from the PPA. For
-#    a private worker image this is an acceptable trade.
-RUN echo "deb [trusted=yes] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
-       > /etc/apt/sources.list.d/deadsnakes.list \
-    && apt-get update && apt-get install -y \
+# Install Python 3.12 + system libs. On Ubuntu 24.04, `python3` already IS
+# 3.12, so there's no PPA setup needed. The `python` -> `python3.12` symlink
+# is added because some downstream tooling expects bare `python` to exist.
+RUN apt-get update && apt-get install -y \
     python3.12 \
     python3.12-venv \
     python3.12-dev \
@@ -62,7 +55,6 @@ RUN echo "deb [trusted=yes] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubun
     ffmpeg \
     openssh-server \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 # Single virtual environment for everything
