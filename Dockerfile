@@ -26,6 +26,14 @@ ENV PYTHONUNBUFFERED=1
 ENV COMFY_API_AVAILABLE_INTERVAL_MS=100
 ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
 
+# Prevent apt post-install hooks from trying to start services during the
+# Docker build. Without this, packages like dbus/packagekit/networkd-dispatcher
+# hang on `Processing triggers for dbus` waiting on a system bus socket that
+# doesn't exist in the build container. policy-rc.d returning exit 101 tells
+# `invoke-rc.d` "deny start, but exit success" so apt continues.
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
 # Install Python 3.12 via deadsnakes (not available natively on Ubuntu 22.04)
 RUN apt-get update && apt-get install -y \
     software-properties-common \
