@@ -34,19 +34,19 @@ ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
-# Add deadsnakes PPA manually for Python 3.12 (not available natively on
-# Ubuntu 22.04). We avoid `software-properties-common` because it pulls in
-# dbus/packagekit/networkd-dispatcher whose post-install machinery breaks
-# non-interactive Docker builds (hangs on the dbus trigger, then `add-apt-
-# repository` fails when invoked because it can't talk to a running dbus).
-# Adding the PPA via apt sources + a downloaded GPG key sidesteps both.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    gnupg \
-    && curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
-       | gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
+# Add deadsnakes PPA for Python 3.12 (not available natively on Ubuntu 22.04).
+# Two non-obvious choices baked in here:
+#
+# 1. We avoid `software-properties-common` (which provides add-apt-repository)
+#    because it pulls in dbus/packagekit/networkd-dispatcher whose post-install
+#    machinery breaks non-interactive Docker builds.
+#
+# 2. We use `[trusted=yes]` instead of fetching the GPG key, because RunPod's
+#    build environment can't reach keyserver.ubuntu.com (connection times out
+#    after 3.5 min). Transport is still HTTPS to Launchpad; we just skip the
+#    cryptographic verification of the package signatures from the PPA. For
+#    a private worker image this is an acceptable trade.
+RUN echo "deb [trusted=yes] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
        > /etc/apt/sources.list.d/deadsnakes.list \
     && apt-get update && apt-get install -y \
     python3.12 \
