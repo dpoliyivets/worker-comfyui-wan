@@ -34,10 +34,20 @@ ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
-# Install Python 3.12 via deadsnakes (not available natively on Ubuntu 22.04)
-RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
+# Add deadsnakes PPA manually for Python 3.12 (not available natively on
+# Ubuntu 22.04). We avoid `software-properties-common` because it pulls in
+# dbus/packagekit/networkd-dispatcher whose post-install machinery breaks
+# non-interactive Docker builds (hangs on the dbus trigger, then `add-apt-
+# repository` fails when invoked because it can't talk to a running dbus).
+# Adding the PPA via apt sources + a downloaded GPG key sidesteps both.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    && curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
+       | gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
+       > /etc/apt/sources.list.d/deadsnakes.list \
     && apt-get update && apt-get install -y \
     python3.12 \
     python3.12-venv \
