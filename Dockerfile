@@ -76,6 +76,16 @@ RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git \
     && cd ComfyUI-Impact-Subpack && pip install -r requirements.txt || true
 
+# Install WanVideoWrapper — Wan2.2 video generation nodes
+RUN cd /comfyui/custom_nodes \
+    && git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
+    && cd ComfyUI-WanVideoWrapper && pip install -r requirements.txt || true
+
+# Install VideoHelperSuite — video I/O utilities (combine frames, load video, etc.)
+RUN cd /comfyui/custom_nodes \
+    && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
+    && cd ComfyUI-VideoHelperSuite && pip install -r requirements.txt || true
+
 # Ensure ultralytics is installed (required for UltralyticsDetectorProvider YOLO loading)
 RUN pip install ultralytics
 
