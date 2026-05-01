@@ -14,6 +14,10 @@ import tempfile
 import socket
 import traceback
 import logging
+from pathlib import Path
+
+import boto3
+from botocore.client import Config as BotoConfig
 
 from network_volume import (
     is_network_volume_debug_enabled,
@@ -58,6 +62,52 @@ COMFY_HOST = "127.0.0.1:8188"
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Helper: upload generated mp4 to the network-volume S3 bucket
+# ---------------------------------------------------------------------------
+
+
+def _upload_video_to_s3(local_mp4_path: str, job_id: str) -> dict:
+    """
+    Upload the generated mp4 to the network-volume S3 bucket and return
+    metadata + a 1-hour presigned download URL. Raises if upload fails;
+    RunPod will mark the job FAILED with the propagated message.
+    """
+    bucket = os.environ["AWS_S3_BUCKET"]
+    prefix = os.environ.get("S3_OUTPUT_PREFIX", "video-outputs/")
+    endpoint_url = os.environ["AWS_S3_ENDPOINT_URL"]
+    region = os.environ.get("AWS_REGION", "us-il-1")
+
+    s3_key = f"{prefix.rstrip('/')}/{job_id}/clip.mp4"
+
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=region,
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+    file_size = Path(local_mp4_path).stat().st_size
+    s3_client.upload_file(
+        Filename=local_mp4_path,
+        Bucket=bucket,
+        Key=s3_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+    )
+
+    presigned_url = s3_client.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": s3_key},
+        ExpiresIn=3600,
+    )
+
+    return {
+        "s3Key": s3_key,
+        "presignedUrl": presigned_url,
+        "fileSizeBytes": file_size,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
@@ -749,6 +799,7 @@ def handler(job):
                 errors.append(warning_msg)
 
         print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
+        video_upload = None  # populated when a VHS_VideoCombine node is found
         for node_id, node_output in outputs.items():
             if "images" in node_output:
                 print(
@@ -838,8 +889,47 @@ def handler(job):
                         error_msg = f"Failed to fetch image data for {filename} from /view endpoint."
                         errors.append(error_msg)
 
-            # Check for other output types
-            other_keys = [k for k in node_output.keys() if k != "images"]
+            # VHS_VideoCombine node outputs mp4 files under the "gifs" key (and
+            # occasionally "videos"). Locate the produced file on disk and upload
+            # it to our S3 bucket, returning a presigned URL to the caller.
+            video_keys = [k for k in node_output.keys() if k in ("gifs", "videos")]
+            if video_keys and video_upload is None:
+                for vkey in video_keys:
+                    for video_info in node_output[vkey]:
+                        filename = video_info.get("filename", "")
+                        if not filename.lower().endswith(".mp4"):
+                            continue
+                        subfolder = video_info.get("subfolder", "")
+                        output_dir = "/comfyui/output"
+                        local_mp4 = os.path.join(output_dir, subfolder, filename).rstrip("/")
+                        if not os.path.exists(local_mp4):
+                            # Fallback: pick the newest mp4 in the output directory
+                            mp4_candidates = sorted(
+                                Path(output_dir).glob("**/*.mp4"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True,
+                            )
+                            if not mp4_candidates:
+                                errors.append(
+                                    f"No mp4 produced in {output_dir} for node {node_id}"
+                                )
+                                break
+                            local_mp4 = str(mp4_candidates[0])
+                        print(
+                            f"worker-comfyui - Uploading video {local_mp4} to S3..."
+                        )
+                        video_upload = _upload_video_to_s3(local_mp4, job_id)
+                        print(
+                            f"worker-comfyui - Video uploaded: s3Key={video_upload['s3Key']}, "
+                            f"size={video_upload['fileSizeBytes']} bytes"
+                        )
+                        break
+                    if video_upload is not None:
+                        break
+
+            # Check for other unhandled output types
+            handled_keys = {"images", "gifs", "videos"}
+            other_keys = [k for k in node_output.keys() if k not in handled_keys]
             if other_keys:
                 warn_msg = (
                     f"Node {node_id} produced unhandled output keys: {other_keys}."
@@ -870,6 +960,24 @@ def handler(job):
             print(f"worker-comfyui - Closing websocket connection.")
             ws.close()
 
+    # ---------------------------------------------------------------------------
+    # Video output path: VHS_VideoCombine produced an mp4 — return S3 metadata.
+    # ---------------------------------------------------------------------------
+    if video_upload is not None:
+        if errors:
+            print(f"worker-comfyui - Job completed with warnings: {errors}")
+        print(
+            f"worker-comfyui - Job completed. Returning video S3 metadata: {video_upload['s3Key']}"
+        )
+        return {
+            "s3Key": video_upload["s3Key"],
+            "presignedUrl": video_upload["presignedUrl"],
+            "fileSizeBytes": video_upload["fileSizeBytes"],
+        }
+
+    # ---------------------------------------------------------------------------
+    # Image output path (original behaviour — kept intact for non-video workflows).
+    # ---------------------------------------------------------------------------
     final_result = {}
 
     if output_data:
