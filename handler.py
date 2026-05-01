@@ -636,7 +636,7 @@ def handler(job):
         run_network_volume_diagnostics()
 
     job_input = job["input"]
-    job_id = job["id"]
+    job_id = job.get("id") or str(uuid.uuid4())
 
     # Make sure that the input is valid
     validated_data, error_message = validate_input(job_input)
