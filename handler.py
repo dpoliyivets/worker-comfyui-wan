@@ -71,8 +71,9 @@ REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 def _upload_video_to_s3(local_mp4_path: str, job_id: str) -> dict:
     """
     Upload the generated mp4 to the network-volume S3 bucket and return
-    metadata + a 1-hour presigned download URL. Raises if upload fails;
-    RunPod will mark the job FAILED with the propagated message.
+    metadata. Consumers download via AWS SDK with account credentials —
+    RunPod's S3 endpoint does not honour query-signed presigned URLs.
+    Raises if upload fails; RunPod marks the job FAILED with the message.
     """
     bucket = os.environ["AWS_S3_BUCKET"]
     prefix = os.environ.get("S3_OUTPUT_PREFIX", "video-outputs/")
@@ -96,15 +97,11 @@ def _upload_video_to_s3(local_mp4_path: str, job_id: str) -> dict:
         ExtraArgs={"ContentType": "video/mp4"},
     )
 
-    presigned_url = s3_client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": s3_key},
-        ExpiresIn=3600,
-    )
-
     return {
         "s3Key": s3_key,
-        "presignedUrl": presigned_url,
+        "bucket": bucket,
+        "endpointUrl": endpoint_url,
+        "region": region,
         "fileSizeBytes": file_size,
     }
 
@@ -891,7 +888,8 @@ def handler(job):
 
             # VHS_VideoCombine node outputs mp4 files under the "gifs" key (and
             # occasionally "videos"). Locate the produced file on disk and upload
-            # it to our S3 bucket, returning a presigned URL to the caller.
+            # it to our S3 bucket. Consumer downloads via AWS SDK with account
+            # credentials — RunPod's S3 endpoint rejects query-signed URLs.
             video_keys = [k for k in node_output.keys() if k in ("gifs", "videos")]
             if video_keys and video_upload is None:
                 for vkey in video_keys:
@@ -971,7 +969,9 @@ def handler(job):
         )
         return {
             "s3Key": video_upload["s3Key"],
-            "presignedUrl": video_upload["presignedUrl"],
+            "bucket": video_upload["bucket"],
+            "endpointUrl": video_upload["endpointUrl"],
+            "region": video_upload["region"],
             "fileSizeBytes": video_upload["fileSizeBytes"],
         }
 
