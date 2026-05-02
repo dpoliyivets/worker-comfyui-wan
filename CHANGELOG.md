@@ -1,5 +1,11 @@
 # [5.3.0](https://github.com/runpod-workers/worker-comfyui/compare/5.2.0...5.3.0) (2025-07-22)
 
+## 5.9.0
+
+### Minor Changes
+
+- a91564c: Install `sageattention` so the WanVideoWrapper `sageattn` attention mode works at runtime. Required for the cost-optimized Wan2.2 I2V base workflow (FP8 weights + Lightning LoRA + sage-attention + TeaCache).
+
 ## 5.8.5
 
 ### Patch Changes
