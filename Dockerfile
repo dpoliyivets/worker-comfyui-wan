@@ -71,24 +71,17 @@ RUN pip install torch torchvision torchaudio --index-url https://download.pytorc
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
     && cd /comfyui && pip install -r requirements.txt
 
-# Install ComfyUI-Manager
+# Install ComfyUI-Manager (general utility, kept for ad-hoc node management
+# during dev — not load-bearing at runtime for the Wan2.2 video workflows).
 RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/ltdrdata/ComfyUI-Manager.git \
     && cd ComfyUI-Manager && pip install -r requirements.txt || true
 
-# Install Impact-Pack for FaceDetailer/DetailerForEach
-RUN cd /comfyui/custom_nodes \
-    && git clone https://github.com/ltdrdata/ComfyUI-Impact-Pack.git \
-    && cd ComfyUI-Impact-Pack && pip install -r requirements.txt || true
-
-# Install Impact-Subpack — provides UltralyticsDetectorProvider (moved out of main pack in V8+)
-RUN cd /comfyui/custom_nodes \
-    && git clone https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git \
-    && cd ComfyUI-Impact-Subpack && pip install -r requirements.txt || true
-
-# Install WanVideoWrapper — Wan2.2 video generation nodes
-# (Bundles WanVideoLoraSelect + WanVideoTeaCache custom nodes used by the
-# cost-optimized base workflow.)
+# Install WanVideoWrapper — Wan2.2 video generation nodes.
+# Provides WanVideoModelLoader, WanVideoSampler, WanVideoLoraSelect,
+# WanVideoImageToVideoEncode, WanVideoDecode, WanVideoTextEncode,
+# WanVideoVAELoader, LoadWanVideoT5TextEncoder. All used by both
+# wan2.2-i2v-480p-base.json and wan2.2-i2v-480p.json.
 RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
     && cd ComfyUI-WanVideoWrapper && pip install -r requirements.txt || true
@@ -98,45 +91,14 @@ RUN cd /comfyui/custom_nodes \
 # matching prebuilt kernel — no build step required.
 RUN pip install sageattention
 
-# Install VideoHelperSuite — video I/O utilities (combine frames, load video, etc.)
+# Install VideoHelperSuite — provides VHS_VideoCombine (encodes the Wan
+# sampler's frame batch into the output mp4).
 RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
     && cd ComfyUI-VideoHelperSuite && pip install -r requirements.txt || true
 
-# Ensure ultralytics is installed (required for UltralyticsDetectorProvider YOLO loading)
-RUN pip install ultralytics
-
 # Install handler dependencies
 RUN pip install runpod requests websocket-client
-
-# Download YOLO detection models (bbox + segmentation)
-RUN mkdir -p /comfyui/models/ultralytics/bbox /comfyui/models/ultralytics/segm \
-    && wget -q -O /comfyui/models/ultralytics/bbox/face_yolov8n.pt \
-       "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8n.pt" \
-    && wget -q -O /comfyui/models/ultralytics/bbox/hand_yolov8s.pt \
-       "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt"
-
-# Copy nipple segmentation model (ADetailer Nipples v2.0 YOLO11s-seg, from CivitAI #490259)
-COPY assets/nipples_v2_yolov11s-seg.pt /comfyui/models/ultralytics/segm/nipples_v2_yolov11s-seg.pt
-
-# Download upscale models
-RUN mkdir -p /comfyui/models/upscale_models \
-    && wget -q -O /comfyui/models/upscale_models/4x-UltraSharp.pth \
-       "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth" \
-    && wget -q -O /comfyui/models/upscale_models/4x_foolhardy_Remacri.pth \
-       "https://huggingface.co/FacehugmanIII/4x_foolhardy_Remacri/resolve/main/4x_foolhardy_Remacri.pth" \
-    && wget -q -O /comfyui/models/upscale_models/RealESRGAN_x2plus.pth \
-       "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
-
-# Download SAM model for precise segmentation masking in FaceDetailer
-RUN mkdir -p /comfyui/models/sams \
-    && wget -q -O /comfyui/models/sams/sam_vit_b_01ec64.pth \
-       "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-
-# Download CodeFormer face restoration model (final face cleanup after upscaling)
-RUN mkdir -p /comfyui/models/facerestore_models \
-    && wget -q -O /comfyui/models/facerestore_models/codeformer-v0.1.0.pth \
-       "https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"
 
 # Add extra model paths for network volume
 WORKDIR /comfyui
