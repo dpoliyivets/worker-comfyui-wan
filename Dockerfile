@@ -87,9 +87,16 @@ RUN cd /comfyui/custom_nodes \
     && cd ComfyUI-Impact-Subpack && pip install -r requirements.txt || true
 
 # Install WanVideoWrapper — Wan2.2 video generation nodes
+# (Bundles WanVideoLoraSelect + WanVideoTeaCache custom nodes used by the
+# cost-optimized base workflow.)
 RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
     && cd ComfyUI-WanVideoWrapper && pip install -r requirements.txt || true
+
+# Install sage-attention so WanVideoModelLoader.attention_mode="sageattn" works.
+# Triton ships with the cu124 PyTorch wheel; the sageattention wheel pulls a
+# matching prebuilt kernel — no build step required.
+RUN pip install sageattention
 
 # Install VideoHelperSuite — video I/O utilities (combine frames, load video, etc.)
 RUN cd /comfyui/custom_nodes \
