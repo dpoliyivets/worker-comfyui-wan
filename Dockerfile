@@ -97,6 +97,16 @@ RUN cd /comfyui/custom_nodes \
     && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
     && cd ComfyUI-VideoHelperSuite && pip install -r requirements.txt || true
 
+# Install ComfyUI-Frame-Interpolation — provides RIFE VFI node so the Wan
+# gen workflow can double its native 16fps output to a smooth 32fps in the
+# same pass (matches the post-processing the refinement worker does, but
+# avoids the S3 round-trip for preview-grade renders). RIFE checkpoint
+# (rife47.pth) is auto-downloaded by the node on first invocation — first
+# cold start after this image rebuild pays ~30s extra.
+RUN cd /comfyui/custom_nodes \
+    && git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git \
+    && cd ComfyUI-Frame-Interpolation && pip install -r requirements-no-cupy.txt || true
+
 # Install handler dependencies
 RUN pip install runpod requests websocket-client
 
