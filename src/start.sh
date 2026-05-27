@@ -24,9 +24,6 @@ export LD_PRELOAD="${TCMALLOC}"
 
 # ---------------------------------------------------------------------------
 # GPU pre-flight check
-# Verify that the GPU is accessible before starting ComfyUI. If PyTorch
-# cannot initialize CUDA the worker will never be able to process jobs,
-# so we fail fast with an actionable error message.
 # ---------------------------------------------------------------------------
 echo "worker-comfyui: Checking GPU availability..."
 if ! GPU_CHECK=$(python3 -c "
@@ -47,6 +44,53 @@ except Exception as e:
 fi
 echo "worker-comfyui: GPU available — $GPU_CHECK"
 
+# ---------------------------------------------------------------------------
+# Ephemeral-pod weight bootstrap.
+# If MANIFEST_URL is set, this container is being used as an ephemeral
+# Wan-batch pod (no network volume mounted). Download the aria2 manifest
+# from R2, install aria2, run the download, signal completion via a
+# sentinel file. Then ComfyUI is started normally below with the freshly
+# downloaded weights visible in /comfyui/models/.
+#
+# We do this in start.sh — not via SSH-exec from the orchestrator — because
+# RunPod's SSH relay (ssh.runpod.io) is unreliable for multi-second commands
+# and large outputs (apt-get update + install drops the session ~half the
+# time). Doing it here keeps the orchestrator's SSH usage to tiny polls.
+# ---------------------------------------------------------------------------
+if [ -n "$MANIFEST_URL" ]; then
+    echo "worker-comfyui: MANIFEST_URL set — bootstrapping ephemeral weights"
+    mkdir -p /workspace /comfyui/models/diffusion_models /comfyui/models/text_encoders /comfyui/models/vae /comfyui/models/loras
+
+    echo "worker-comfyui: Installing aria2…"
+    if ! apt-get update -qq && apt-get install -y aria2 > /tmp/apt-install.log 2>&1; then
+        echo "worker-comfyui: aria2 install FAILED — see /tmp/apt-install.log"
+        cat /tmp/apt-install.log
+        exit 1
+    fi
+
+    echo "worker-comfyui: Downloading manifest from R2…"
+    if ! wget --quiet -O /workspace/manifest.aria2 "$MANIFEST_URL"; then
+        echo "worker-comfyui: manifest wget FAILED"
+        exit 1
+    fi
+
+    echo "worker-comfyui: Running aria2c (5 files × 5 connections)…"
+    if ! aria2c -i /workspace/manifest.aria2 \
+        -j 5 -x 5 -s 5 \
+        --auto-file-renaming=false \
+        --allow-overwrite=true \
+        --console-log-level=warn \
+        --summary-interval=15 > /tmp/aria2c.log 2>&1; then
+        echo "worker-comfyui: aria2c download FAILED — see /tmp/aria2c.log"
+        tail -50 /tmp/aria2c.log
+        exit 1
+    fi
+
+    # Sentinel — the orchestrator polls for this file via a tiny SSH command.
+    date -u +%Y-%m-%dT%H:%M:%SZ > /workspace/download.done
+    echo "worker-comfyui: Weight bootstrap complete"
+fi
+
 # Ensure ComfyUI-Manager runs in offline network mode inside the container
 comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
 
@@ -55,20 +99,6 @@ echo "worker-comfyui: Starting ComfyUI"
 # Allow operators to tweak verbosity; default is DEBUG.
 : "${COMFY_LOG_LEVEL:=DEBUG}"
 
-# PID file used by the handler to detect if ComfyUI is still running.
-#
-# The handler's check_server() polls /tmp/comfyui.pid to decide whether to
-# wait indefinitely for ComfyUI (PID found → poll until process dies) or fall
-# back to a 500-attempt retry limit (no PID → ~25s hard timeout). The bounded
-# fallback has proven too short for flaky RunPod workers with slow cold
-# starts, so it's critical that the PID file always reflects the CURRENT
-# ComfyUI process before the handler starts.
-#
-# Two defensive measures below:
-#   1. Remove any stale PID file from a previous container lifetime so the
-#      handler can never observe a PID pointing at a dead process.
-#   2. Write the new PID via a temp file + atomic rename so the handler can
-#      never observe a half-written or zero-byte file.
 COMFY_PID_FILE="/tmp/comfyui.pid"
 COMFY_PID_FILE_TMP="${COMFY_PID_FILE}.tmp"
 rm -f "$COMFY_PID_FILE" "$COMFY_PID_FILE_TMP"
@@ -87,9 +117,20 @@ if [ "$SERVE_API_LOCALLY" == "true" ]; then
     echo "worker-comfyui: Starting RunPod Handler"
     python -u /handler.py --rp_serve_api --rp_api_host=0.0.0.0
 else
-    python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
-    write_comfy_pid_file "$!"
+    # Ephemeral mode: bind ComfyUI to 0.0.0.0 so the orchestrator can probe
+    # /system_stats over the SSH relay (which exec-runs `curl localhost:8188/...`).
+    if [ -n "$MANIFEST_URL" ]; then
+        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen 0.0.0.0 --port 8188 --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
+        write_comfy_pid_file "$!"
+        echo "worker-comfyui: Ephemeral mode — sleeping forever (no serverless handler)"
+        # Don't launch handler.py — there's no serverless queue feeding this pod.
+        # Sleep keeps the container alive so the orchestrator can dispatch via SSH.
+        sleep infinity
+    else
+        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
+        write_comfy_pid_file "$!"
 
-    echo "worker-comfyui: Starting RunPod Handler"
-    python -u /handler.py
+        echo "worker-comfyui: Starting RunPod Handler"
+        python -u /handler.py
+    fi
 fi
