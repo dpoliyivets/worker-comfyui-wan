@@ -62,8 +62,17 @@ if [ -n "$MANIFEST_URL" ]; then
     mkdir -p /workspace /comfyui/models/diffusion_models /comfyui/models/text_encoders /comfyui/models/vae /comfyui/models/loras
 
     echo "worker-comfyui: Installing aria2…"
-    if ! apt-get update -qq && apt-get install -y aria2 > /tmp/apt-install.log 2>&1; then
+    # Grouped with braces so the redirect captures both commands' output and
+    # `!` negates the combined exit status. Without the braces, bash parses
+    # `! cmd1 && cmd2` as `(!cmd1) && cmd2` — when cmd1 succeeds, the `&&`
+    # short-circuits and cmd2 (the actual install) never runs.
+    if ! { apt-get update -qq && apt-get install -y aria2; } > /tmp/apt-install.log 2>&1; then
         echo "worker-comfyui: aria2 install FAILED — see /tmp/apt-install.log"
+        cat /tmp/apt-install.log
+        exit 1
+    fi
+    if ! command -v aria2c > /dev/null; then
+        echo "worker-comfyui: aria2c missing after install — aborting"
         cat /tmp/apt-install.log
         exit 1
     fi
