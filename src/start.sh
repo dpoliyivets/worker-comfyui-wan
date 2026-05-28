@@ -91,7 +91,13 @@ if [ -n "$MANIFEST_URL" ]; then
     fi
 
     echo "worker-comfyui: Running aria2c (5 files × 5 connections)…"
+    # -d /  — aria2 treats `out=/abs/path` as relative to its working dir even
+    # when out starts with `/`. Without -d, cwd at exec time (typically /) was
+    # OK by luck, but inside the container start.sh runs from `/` so out=/comfyui/...
+    # produced /comfyui/comfyui/... (double-prefix). Pin -d / so absolute paths
+    # in the manifest land where they say they do.
     if ! aria2c -i /workspace/manifest.aria2 \
+        -d / \
         -j 5 -x 5 -s 5 \
         --auto-file-renaming=false \
         --allow-overwrite=true \
