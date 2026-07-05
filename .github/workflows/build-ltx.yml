@@ -2,14 +2,19 @@ name: Build LTX serverless images (baked weights, split by is_nsfw)
 
 # Builds the two baked-weights LTX-2.3 serverless worker images from
 # Dockerfile.ltx — one per LTX_VARIANT (sfw = official dev-fp8, nsfw = 10Eros).
-# Each image bakes its single 22B checkpoint + the shared encoder/LoRAs/upscaler
-# + the 4 NSFW LoRAs (~35-42 GB), so a scale-to-zero RunPod worker needs no
-# runtime weight download in any region.
+# Runs on GitHub-hosted ubuntu-latest runners (real Linux + fast datacenter
+# network), NOT Blacksmith (its runner connection can be down) and NOT a Mac
+# (Docker Desktop's VM network bridge drops the 29 GB single-layer upload — the
+# whole reason we build here instead of locally).
 #
-# Manual only (a 40 GB build is not something to run on every push). The R2
-# access/secret keys arrive as BuildKit secrets (never baked into a layer); the
-# R2 endpoint/bucket are non-sensitive build-args. Pushes to Docker Hub
-# ${DOCKERHUB_REPO}/${DOCKERHUB_IMG}:ltx-<variant>-<tag>.
+# Disk: a ~62 GB image won't fit a stock runner's ~29 GB free root, so
+# maximize-build-space carves an ~80 GB LVM volume (from the removed preinstalled
+# SDKs) and mounts it at /var/lib/docker. Each matrix leg (sfw/nsfw) gets its own
+# runner, so only one 62 GB image is ever on a single runner's disk.
+#
+# Secrets: R2 keys arrive as BuildKit build-secrets (never baked into a layer);
+# R2 endpoint/bucket + LTX_VARIANT are build-args. Docker Hub creds from repo
+# secrets. Manual only.
 
 on:
   workflow_dispatch:
@@ -21,23 +26,32 @@ on:
 
 jobs:
   build-ltx:
-    runs-on: [blacksmith-8vcpu-ubuntu-2204, linux]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        variant: [sfw, nsfw]
+        variant: [nsfw, sfw]
 
     steps:
+      - name: Maximize build disk space (~80 GB LVM at /var/lib/docker)
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1024
+          overprovision-lvm: "true"
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          build-mount-path: "/var/lib/docker"
+
+      - name: Restart docker onto the enlarged volume
+        run: sudo service docker restart
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Free up runner disk (a baked 22B-checkpoint image is large)
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY" || true
-          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
-          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -48,11 +62,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: blacksmith docker layer cache
-        uses: useblacksmith/build-push-action@v1
-        with:
-          setup-only: true
-
       - name: Resolve image tag
         id: meta
         run: |
@@ -61,7 +70,7 @@ jobs:
           echo "image=${{ vars.DOCKERHUB_REPO }}/${{ vars.DOCKERHUB_IMG }}:ltx-${{ matrix.variant }}-${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push LTX ${{ matrix.variant }} image
-        uses: useblacksmith/build-push-action@v1
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.ltx

@@ -121,8 +121,11 @@ RUN set -eux; cd /comfyui; \
 # 2) The 4 R2-mirrored NSFW LoRAs (BOTH variants — DR34ML4Y + VBVR apply on every
 #    beat incl. SFW; Penile_Praxis + per-geometry gate on cock-in-frame). Small,
 #    cached separately. Creds via BuildKit secret only (never land in a layer).
+# NOTE: `set -eu` WITHOUT -x — tracing (-x) would echo the R2 keys read from the
+# BuildKit secret into the build log (fine for the image, which stays clean, but
+# it would leak the keys to CI logs). Keep -x off in every secret-handling RUN.
 RUN --mount=type=secret,id=r2_access_key --mount=type=secret,id=r2_secret_key \
-    set -eux; cd /comfyui; \
+    set -eu; cd /comfyui; \
     export AWS_ACCESS_KEY_ID="$(cat /run/secrets/r2_access_key)"; \
     export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/r2_secret_key)"; \
     for f in DR34ML4Y_LTXXX_V2 Penile_Praxis_V4 VBVR_I2V_V3 DT_K3NK_V3; do \
@@ -133,8 +136,9 @@ RUN --mount=type=secret,id=r2_access_key --mount=type=secret,id=r2_secret_key \
 
 # 3) The VARIANT 22B checkpoint — the whole reason for the split. sfw → official
 #    dev-fp8 (public HF); nsfw → 10Eros (R2, secret). Exactly one per image.
+# `set -eu` (no -x) — see the secret-echo note above.
 RUN --mount=type=secret,id=r2_access_key --mount=type=secret,id=r2_secret_key \
-    set -eux; cd /comfyui; \
+    set -eu; cd /comfyui; \
     if [ "${LTX_VARIANT}" = "sfw" ]; then \
       wget -q -O models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
         "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"; \
