@@ -1,0 +1,192 @@
+# ComfyUI LTX-2.3 Worker for RunPod Serverless — WEIGHTS BAKED IN.
+#
+# Why a separate image from the Wan Dockerfile: the on-demand LTX *pod*
+# (LtxPodService) downloads ~70 GB of weights from HF+R2 into container disk on
+# every cold boot, and RunPod network volumes are region-pinned — so running
+# global (cloudType ALL) for capacity means the volume isn't present and the
+# weights re-download every time (the 20-min boot). Baking the weights INTO the
+# image removes the runtime download entirely: any region works, and RunPod
+# caches the image per host so cold start becomes model-load, not a 70 GB pull.
+#
+# Native LTX-2.3 runs on ComfyUI CORE nodes only (no custom node — the
+# Lightricks/ComfyUI-LTXVideo node is kornia-broken and unneeded, per
+# video-generation-canonical.md Part 6). ComfyUI is pinned to the pilot commit
+# so the baked nodes match the ltx-{ia2v,i2v}.api.json workflow templates.
+#
+# Split by is_nsfw (cold-start optimisation): built TWICE, once per LTX_VARIANT,
+# so each image carries ONE 22B checkpoint (~40 GB, not ~70 GB) → faster
+# first-pull-per-machine, and a scale-to-zero worker loads a single resident
+# checkpoint with no swap. The client routes a beat to the SFW or NSFW endpoint
+# by is_nsfw.
+#
+# Build (BuildKit required for the R2 secrets) — once per variant:
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.ltx --build-arg LTX_VARIANT=nsfw \
+#     --secret id=r2_access_key,env=R2_ACCESS_KEY_ID \
+#     --secret id=r2_secret_key,env=R2_SECRET_ACCESS_KEY \
+#     --build-arg R2_ENDPOINT=$R2_ENDPOINT --build-arg R2_BUCKET=$R2_BUCKET \
+#     -t dpoliyivets1/worker-comfyui-ltx:nsfw-<sha> .
+#   (…and again with --build-arg LTX_VARIANT=sfw -t …:sfw-<sha>)
+# In CI the two secrets come from the worker repo's GitHub secrets; the base LTX
+# weights + the SFW checkpoint are public HF (no secret). The R2 objects (10Eros
+# + 4 NSFW LoRAs) must already exist — verify `ltx-checkpoints/` + `ltx-loras/`
+# before building.
+
+ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE} AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_PREFER_BINARY=1
+ENV PYTHONUNBUFFERED=1
+
+# handler.py cold-start wait window (see Wan Dockerfile rationale) — LTX loads
+# two 22B checkpoints, so keep the generous fallback.
+ENV COMFY_API_AVAILABLE_INTERVAL_MS=100
+ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
+
+# ComfyUI commit that carries the native LTX-2.3 nodes the workflow templates
+# target (parity with the worker-comfyui-ltx:pilot-7d4194d pod image).
+ARG COMFYUI_REF=7d4194d
+
+# Which 22B checkpoint this image bakes: "nsfw" → 10Eros (R2), "sfw" → official
+# dev-fp8 (public HF). Everything else is baked into both variants.
+ARG LTX_VARIANT=nsfw
+
+# R2 (S3-compatible) source for the mirrored NSFW weights. Non-secret coords;
+# the access/secret keys arrive via --mount=type=secret and never hit a layer.
+ARG R2_ENDPOINT
+ARG R2_BUCKET
+
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
+RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    git \
+    wget \
+    curl \
+    unzip \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    openssh-server \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN pip install --upgrade pip setuptools wheel
+
+# PyTorch cu124 (works against the 12.6 runtime via forward compat; bundles its
+# own CUDA libs) — same as the Wan worker.
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# ComfyUI core, pinned. Native LTX-2.3 nodes ship in core at this ref, INCLUDING
+# the output node: ltx-{ia2v,i2v}.api.json write the clip via the core `SaveVideo`
+# node (verified against the templates), so NO VideoHelperSuite / custom node is
+# needed — the "no custom node" claim holds end-to-end.
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF} \
+    && pip install -r requirements.txt
+
+# Handler deps + awscli (for the R2 fetch below).
+RUN pip install runpod requests websocket-client awscli
+
+# ---------------------------------------------------------------------------
+# BAKE THE WEIGHTS (~70 GB). This is the whole point of the image.
+#
+# Layer split so a change to the (small) R2 LoRAs doesn't rebuild the (huge)
+# base-checkpoint layer, and vice-versa — Docker caches each RUN independently.
+# ---------------------------------------------------------------------------
+
+# 1) Shared public-HF base weights (BOTH variants) — text encoder, distill LoRA,
+#    gemma-abliterated LoRA, spatial upscaler. Plain-LFS direct URLs (wget-able;
+#    NOT the Xet repos aria2 fails on). The 22B checkpoint is baked separately
+#    (step 3) so this large shared layer caches across both variant builds.
+RUN set -eux; cd /comfyui; \
+    mkdir -p models/checkpoints models/text_encoders models/loras models/latent_upscale_models; \
+    wget -q -O models/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors \
+      "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"; \
+    wget -q -O models/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors \
+      "https://huggingface.co/Comfy-Org/ltx-2.3/resolve/main/split_files/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors"; \
+    wget -q -O models/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors \
+      "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors"; \
+    wget -q -O models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+      "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+
+# 2) The 4 R2-mirrored NSFW LoRAs (BOTH variants — DR34ML4Y + VBVR apply on every
+#    beat incl. SFW; Penile_Praxis + per-geometry gate on cock-in-frame). Small,
+#    cached separately. Creds via BuildKit secret only (never land in a layer).
+RUN --mount=type=secret,id=r2_access_key --mount=type=secret,id=r2_secret_key \
+    set -eux; cd /comfyui; \
+    export AWS_ACCESS_KEY_ID="$(cat /run/secrets/r2_access_key)"; \
+    export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/r2_secret_key)"; \
+    for f in DR34ML4Y_LTXXX_V2 Penile_Praxis_V4 VBVR_I2V_V3 DT_K3NK_V3; do \
+      aws s3 cp --endpoint-url "${R2_ENDPOINT}" \
+        "s3://${R2_BUCKET}/ltx-loras/${f}.safetensors" \
+        "models/loras/${f}.safetensors"; \
+    done
+
+# 3) The VARIANT 22B checkpoint — the whole reason for the split. sfw → official
+#    dev-fp8 (public HF); nsfw → 10Eros (R2, secret). Exactly one per image.
+RUN --mount=type=secret,id=r2_access_key --mount=type=secret,id=r2_secret_key \
+    set -eux; cd /comfyui; \
+    if [ "${LTX_VARIANT}" = "sfw" ]; then \
+      wget -q -O models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+        "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"; \
+    elif [ "${LTX_VARIANT}" = "nsfw" ]; then \
+      export AWS_ACCESS_KEY_ID="$(cat /run/secrets/r2_access_key)"; \
+      export AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/r2_secret_key)"; \
+      aws s3 cp --endpoint-url "${R2_ENDPOINT}" \
+        "s3://${R2_BUCKET}/ltx-checkpoints/10Eros_v1-fp8mixed_learned.safetensors" \
+        models/checkpoints/10Eros_v1-fp8mixed_learned.safetensors; \
+    else echo "LTX_VARIANT must be sfw|nsfw, got '${LTX_VARIANT}'" >&2; exit 1; fi
+
+# Sanity-fail the build if any shared weight OR the variant checkpoint is
+# missing/empty (a silent 404 on the pod path was the "prod boot 404s" footgun —
+# catch it at build time, not on the first paid render).
+RUN set -eux; cd /comfyui; \
+    for p in \
+      models/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors \
+      models/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors \
+      models/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors \
+      models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+      models/loras/DR34ML4Y_LTXXX_V2.safetensors \
+      models/loras/Penile_Praxis_V4.safetensors \
+      models/loras/VBVR_I2V_V3.safetensors \
+      models/loras/DT_K3NK_V3.safetensors; do \
+      test -s "$p" || { echo "MISSING/EMPTY baked weight: $p" >&2; exit 1; }; \
+    done; \
+    if [ "${LTX_VARIANT}" = "sfw" ]; then \
+      test -s models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors \
+        || { echo "MISSING/EMPTY sfw checkpoint" >&2; exit 1; }; \
+    else \
+      test -s models/checkpoints/10Eros_v1-fp8mixed_learned.safetensors \
+        || { echo "MISSING/EMPTY nsfw checkpoint" >&2; exit 1; }; \
+    fi
+
+ENV PIP_NO_INPUT=1
+
+# Handler + startup. Same handler as the Wan worker (workflow + images/files in,
+# output out) — the LTX audio-input (IA2V WAV) support is added in handler.py.
+WORKDIR /comfyui
+COPY src/extra_model_paths.yaml ./
+WORKDIR /
+COPY src/start.sh src/network_volume.py handler.py test_input.json ./
+RUN chmod +x /start.sh
+COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+RUN chmod +x /usr/local/bin/comfy-manager-set-mode || true
+
+# Lean the image (#4 cold-start): drop build-only tooling + caches so the pull is
+# weights + runtime, not the ComfyUI git history, awscli, and pip wheels. The
+# 22B weights dominate, but shaving ~1-2 GB still trims first-pull-per-machine.
+RUN pip uninstall -y awscli 2>/dev/null || true; \
+    pip cache purge 2>/dev/null || true; \
+    rm -rf /comfyui/.git /root/.cache /tmp/* /var/tmp/*
+
+WORKDIR /comfyui
+CMD ["/start.sh"]

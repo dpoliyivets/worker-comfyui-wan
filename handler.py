@@ -232,6 +232,21 @@ def validate_input(job_input):
                 "'images' must be a list of objects with 'name' and 'image' keys",
             )
 
+    # Validate 'files' in input, if provided. Generic base64 input files written
+    # verbatim into ComfyUI's input/ dir (e.g. the LTX IA2V conditioning WAV that
+    # a LoadAudio node references by name). Distinct from 'images' (which the
+    # frontend upload path treats as picture data) so audio/other binaries carry
+    # their own content-type. Backward compatible: the Wan path sends no 'files'.
+    files = job_input.get("files")
+    if files is not None:
+        if not isinstance(files, list) or not all(
+            "name" in f and "data" in f for f in files
+        ):
+            return (
+                None,
+                "'files' must be a list of objects with 'name' and 'data' keys",
+            )
+
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
 
@@ -239,6 +254,7 @@ def validate_input(job_input):
     return {
         "workflow": workflow,
         "images": images,
+        "files": files,
         "comfy_org_api_key": comfy_org_api_key,
     }, None
 
@@ -416,6 +432,65 @@ def upload_images(images):
     return {
         "status": "success",
         "message": "All images uploaded successfully",
+        "details": responses,
+    }
+
+
+def upload_files(files):
+    """
+    Upload a list of base64-encoded generic input files to ComfyUI's input/ dir
+    via the /upload/image endpoint (which stores any bytes under the given
+    filename regardless of content-type). Used for the LTX IA2V conditioning WAV
+    that a LoadAudio node references by name.
+
+    Args:
+        files (list): dicts with 'name' and 'data' (base64, optional data-URI prefix).
+
+    Returns:
+        dict: {'status': 'success'|'error', ...}.
+    """
+    if not files:
+        return {"status": "success", "message": "No files to upload", "details": []}
+
+    responses = []
+    upload_errors = []
+    print(f"worker-comfyui - Uploading {len(files)} file(s)...")
+
+    for f in files:
+        name = f.get("name", "unknown")
+        try:
+            data_uri = f["data"]
+            base64_data = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+            blob = base64.b64decode(base64_data)
+            content_type = (
+                "audio/x-wav"
+                if name.lower().endswith(".wav")
+                else "application/octet-stream"
+            )
+            form = {
+                "image": (name, BytesIO(blob), content_type),
+                "overwrite": (None, "true"),
+            }
+            response = requests.post(
+                f"http://{COMFY_HOST}/upload/image", files=form, timeout=60
+            )
+            response.raise_for_status()
+            responses.append(f"Successfully uploaded {name}")
+            print(f"worker-comfyui - Successfully uploaded {name}")
+        except Exception as e:
+            error_msg = f"Error uploading file {name}: {e}"
+            print(f"worker-comfyui - {error_msg}")
+            upload_errors.append(error_msg)
+
+    if upload_errors:
+        return {
+            "status": "error",
+            "message": "Some files failed to upload",
+            "details": upload_errors,
+        }
+    return {
+        "status": "success",
+        "message": "All files uploaded successfully",
         "details": responses,
     }
 
@@ -664,6 +739,16 @@ def handler(job):
                 "details": upload_result["details"],
             }
 
+    # Upload generic input files (e.g. the LTX IA2V conditioning WAV) if present
+    input_files = validated_data.get("files")
+    if input_files:
+        files_result = upload_files(input_files)
+        if files_result["status"] == "error":
+            return {
+                "error": "Failed to upload one or more input files",
+                "details": files_result["details"],
+            }
+
     ws = None
     client_id = str(uuid.uuid4())
     prompt_id = None
@@ -797,6 +882,7 @@ def handler(job):
 
         print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
         video_upload = None  # populated when a VHS_VideoCombine node is found
+        video_b64 = None  # populated instead when VIDEO_RETURN_BASE64 is set
         for node_id, node_output in outputs.items():
             if "images" in node_output:
                 print(
@@ -890,8 +976,11 @@ def handler(job):
             # occasionally "videos"). Locate the produced file on disk and upload
             # it to our S3 bucket. Consumer downloads via AWS SDK with account
             # credentials — RunPod's S3 endpoint rejects query-signed URLs.
+            # Native LTX SaveVideo emits under "gifs"/"videos" too (mp4 filename);
+            # the fallback newest-mp4 scan covers any key drift between ComfyUI
+            # video-save nodes.
             video_keys = [k for k in node_output.keys() if k in ("gifs", "videos")]
-            if video_keys and video_upload is None:
+            if video_keys and video_upload is None and video_b64 is None:
                 for vkey in video_keys:
                     for video_info in node_output[vkey]:
                         filename = video_info.get("filename", "")
@@ -913,16 +1002,37 @@ def handler(job):
                                 )
                                 break
                             local_mp4 = str(mp4_candidates[0])
-                        print(
-                            f"worker-comfyui - Uploading video {local_mp4} to S3..."
-                        )
-                        video_upload = _upload_video_to_s3(local_mp4, job_id)
-                        print(
-                            f"worker-comfyui - Video uploaded: s3Key={video_upload['s3Key']}, "
-                            f"size={video_upload['fileSizeBytes']} bytes"
-                        )
+                        # VIDEO_RETURN_BASE64 (set on the LTX endpoints): return the
+                        # clip inline as base64 rather than to a region-locked S3
+                        # bucket — the whole migration's point is region independence,
+                        # and LTX clips are <1 MB so they fit the response payload.
+                        if os.environ.get("VIDEO_RETURN_BASE64", "").lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                        ):
+                            with open(local_mp4, "rb") as vf:
+                                blob = vf.read()
+                            video_b64 = {
+                                "filename": os.path.basename(local_mp4),
+                                "data": base64.b64encode(blob).decode("utf-8"),
+                                "fileSizeBytes": len(blob),
+                            }
+                            print(
+                                f"worker-comfyui - Returning video base64: "
+                                f"{video_b64['filename']} ({video_b64['fileSizeBytes']} bytes)"
+                            )
+                        else:
+                            print(
+                                f"worker-comfyui - Uploading video {local_mp4} to S3..."
+                            )
+                            video_upload = _upload_video_to_s3(local_mp4, job_id)
+                            print(
+                                f"worker-comfyui - Video uploaded: s3Key={video_upload['s3Key']}, "
+                                f"size={video_upload['fileSizeBytes']} bytes"
+                            )
                         break
-                    if video_upload is not None:
+                    if video_upload is not None or video_b64 is not None:
                         break
 
             # Check for other unhandled output types
@@ -957,6 +1067,22 @@ def handler(job):
         if ws and ws.connected:
             print(f"worker-comfyui - Closing websocket connection.")
             ws.close()
+
+    # ---------------------------------------------------------------------------
+    # Video output path (base64): the clip is returned inline. Preferred for LTX
+    # (region-independent, no output bucket). Shape mirrors an image output entry.
+    # ---------------------------------------------------------------------------
+    if video_b64 is not None:
+        if errors:
+            print(f"worker-comfyui - Job completed with warnings: {errors}")
+        print(
+            f"worker-comfyui - Job completed. Returning video base64: {video_b64['filename']}"
+        )
+        return {
+            "video_base64": video_b64["data"],
+            "filename": video_b64["filename"],
+            "fileSizeBytes": video_b64["fileSizeBytes"],
+        }
 
     # ---------------------------------------------------------------------------
     # Video output path: VHS_VideoCombine produced an mp4 — return S3 metadata.
