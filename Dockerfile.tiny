@@ -1,0 +1,8 @@
+# Throwaway cold-start probe: measures RunPod machine-allocation time in
+# isolation. Tiny image (~150MB) + trivial handler → delayTime ≈ allocation
+# (+ a few-second pull), so comparing its delayTime to the real LTX image's
+# ~468s tells us how much of the 431s pre-container is allocation vs image pull.
+FROM python:3.12-slim
+RUN pip install --no-cache-dir runpod
+COPY tiny_handler.py /handler.py
+CMD ["python", "-u", "/handler.py"]
