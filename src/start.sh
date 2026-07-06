@@ -113,6 +113,22 @@ if [ -n "$MANIFEST_URL" ]; then
     echo "worker-comfyui: Weight bootstrap complete"
 fi
 
+# ---------------------------------------------------------------------------
+# LTX serverless lazy-weights bootstrap.
+# The LTX serverless image ships WITHOUT baked weights (a baked 22B checkpoint
+# makes the image ~62 GB — unbuildable/unpushable on our CI/registry/pods). When
+# LTX_BOOTSTRAP is set, download this worker's variant weights into container
+# disk now, then fall through to the NORMAL serverless handler below (unlike the
+# MANIFEST_URL/ephemeral path, which sleeps forever). See download-ltx-weights.sh.
+# ---------------------------------------------------------------------------
+if [ -n "$LTX_BOOTSTRAP" ]; then
+    echo "worker-comfyui: LTX_BOOTSTRAP set — downloading LTX weights (variant=${LTX_VARIANT:-unset})"
+    if ! /download-ltx-weights.sh; then
+        echo "worker-comfyui: LTX weight download FAILED — aborting boot" >&2
+        exit 1
+    fi
+fi
+
 # Ensure ComfyUI-Manager runs in offline network mode inside the container
 comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
 

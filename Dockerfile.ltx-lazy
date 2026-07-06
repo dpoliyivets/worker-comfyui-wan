@@ -1,0 +1,94 @@
+# ComfyUI LTX-2.3 Worker for RunPod Serverless — LAZY WEIGHTS (downloaded at boot).
+#
+# Companion to Dockerfile.ltx (baked). The baked image is ~62 GB (a 22B checkpoint
+# baked in) and can't be built+pushed on any infra we have: Docker Desktop's Mac
+# VM drops the 29 GB single-layer push, a stock GitHub runner's disk can't hold a
+# 62 GB image's export, and a RunPod pod is a seccomp-locked container that can't
+# run any image builder. So this variant ships WITHOUT weights (~10 GB, builds and
+# pushes anywhere) and the worker downloads its variant's weights into container
+# disk on cold start — the same download-on-boot the on-demand LtxPodService does.
+#
+# ONE image, TWO endpoints: the sfw/nsfw split moves to endpoint env (LTX_VARIANT)
+# instead of two baked images. download-ltx-weights.sh pulls the shared base
+# weights + 4 NSFW LoRAs for both, and the one 22B checkpoint for the variant.
+#
+# Build (no secrets, no build-args — nothing weight-related at build time):
+#   docker build -f Dockerfile.ltx-lazy -t dpoliyivets1/worker-comfyui-wan:ltx-lazy-<sha> .
+# Runtime env the worker needs: LTX_BOOTSTRAP=1, LTX_VARIANT=sfw|nsfw,
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, R2_BUCKET,
+#   VIDEO_RETURN_BASE64=true.
+
+ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE} AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_PREFER_BINARY=1
+ENV PYTHONUNBUFFERED=1
+
+# handler.py cold-start wait window — LTX loads a 22B checkpoint, so keep the
+# generous fallback (weights also download first, so the handler waits on both).
+ENV COMFY_API_AVAILABLE_INTERVAL_MS=100
+ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
+
+# ComfyUI commit that carries the native LTX-2.3 nodes the workflow templates
+# target (parity with the worker-comfyui-ltx:pilot-7d4194d pod image).
+ARG COMFYUI_REF=7d4194d
+
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
+# aria2 (fast parallel boot download) is added vs the baked image; everything
+# else matches. openssh-server kept for dev-sync/SSH parity.
+RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    git \
+    wget \
+    curl \
+    unzip \
+    aria2 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    openssh-server \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN pip install --upgrade pip setuptools wheel
+
+# PyTorch cu124 (works against the 12.6 runtime via forward compat).
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# ComfyUI core, pinned. Native LTX-2.3 nodes (incl. the SaveVideo output node)
+# ship in core at this ref — no custom node needed.
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF} \
+    && pip install -r requirements.txt
+
+# Handler deps + awscli — awscli STAYS in the runtime image (the baked image
+# uninstalled it; here it presigns the R2 objects for the boot download).
+RUN pip install runpod requests websocket-client awscli
+
+ENV PIP_NO_INPUT=1
+
+# Handler + startup + the LTX boot-download script.
+WORKDIR /comfyui
+COPY src/extra_model_paths.yaml ./
+WORKDIR /
+COPY src/start.sh src/network_volume.py src/download-ltx-weights.sh handler.py test_input.json ./
+RUN chmod +x /start.sh /download-ltx-weights.sh
+COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+RUN chmod +x /usr/local/bin/comfy-manager-set-mode || true
+
+# Lean the image — no weights to shave here, just build tooling + caches.
+RUN pip cache purge 2>/dev/null || true; \
+    rm -rf /comfyui/.git /root/.cache /tmp/* /var/tmp/*
+
+WORKDIR /comfyui
+CMD ["/start.sh"]

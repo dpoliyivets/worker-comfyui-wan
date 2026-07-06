@@ -1,0 +1,51 @@
+name: Build LTX serverless image (lazy weights)
+
+# Builds the single LTX-2.3 serverless worker image from Dockerfile.ltx-lazy.
+# No baked weights → ~10 GB → builds and pushes on a stock ubuntu-latest runner
+# with no disk-maximizing, no build secrets, no matrix. The sfw/nsfw split is an
+# endpoint-env concern (LTX_VARIANT), so ONE image serves both endpoints; each
+# worker downloads its variant's weights at cold start (download-ltx-weights.sh).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag suffix (default: short commit SHA)"
+        required: false
+        type: string
+
+jobs:
+  build-ltx-lazy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(git rev-parse --short HEAD)"; fi
+          echo "image=${{ vars.DOCKERHUB_REPO }}/${{ vars.DOCKERHUB_IMG }}:ltx-lazy-${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push LTX lazy image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ltx-lazy
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+
+      - name: Print pushed image
+        run: echo "Pushed ${{ steps.meta.outputs.image }}"
