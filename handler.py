@@ -691,6 +691,43 @@ def get_image_data(filename, subfolder, image_type):
         return None
 
 
+# Cold-start timing: captured at module import (≈ handler process start) and
+# merged with the phase markers start.sh writes to /tmp/boot-timing. Returned in
+# the job output so the download-vs-boot split is readable via the status API
+# (RunPod exposes no serverless container-log API).
+_HANDLER_IMPORT_TS = time.time()
+
+
+def _boot_timing():
+    info = {
+        "handler_import_ts": round(_HANDLER_IMPORT_TS, 3),
+        "reported_at": round(time.time(), 3),
+    }
+    try:
+        with open("/tmp/boot-timing") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    try:
+                        info[k] = float(v)
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        info["note"] = "no /tmp/boot-timing"
+        return info
+    if "download_start" in info and "download_end" in info:
+        info["download_secs"] = round(info["download_end"] - info["download_start"], 1)
+    if "container_start" in info:
+        info["container_to_handler_secs"] = round(
+            _HANDLER_IMPORT_TS - info["container_start"], 1
+        )
+    if "comfy_launch" in info:
+        info["comfy_boot_to_handler_secs"] = round(
+            _HANDLER_IMPORT_TS - info["comfy_launch"], 1
+        )
+    return info
+
+
 def handler(job):
     """
     Handles a job using ComfyUI via websockets for status and image retrieval.
@@ -1082,6 +1119,7 @@ def handler(job):
             "video_base64": video_b64["data"],
             "filename": video_b64["filename"],
             "fileSizeBytes": video_b64["fileSizeBytes"],
+            "boot_timing": _boot_timing(),
         }
 
     # ---------------------------------------------------------------------------
@@ -1126,6 +1164,7 @@ def handler(job):
         final_result["status"] = "success_no_images"
         final_result["images"] = []
 
+    final_result["boot_timing"] = _boot_timing()
     print(f"worker-comfyui - Job completed. Returning {len(output_data)} image(s).")
     return final_result
 

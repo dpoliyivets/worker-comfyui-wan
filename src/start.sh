@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# Cold-start timing markers — the handler reads /tmp/boot-timing and returns it
+# in the job output so the download-vs-boot split is observable via the status
+# API (RunPod exposes no serverless container-log API).
+BOOT_TIMING=/tmp/boot-timing
+bt() { echo "$1=$(date +%s.%N)" >> "$BOOT_TIMING"; }
+: > "$BOOT_TIMING"; bt container_start
+
 # Start SSH server if PUBLIC_KEY is set (enables remote access and dev-sync.sh)
 if [ -n "$PUBLIC_KEY" ]; then
     mkdir -p ~/.ssh
@@ -123,15 +130,18 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "$LTX_BOOTSTRAP" ]; then
     echo "worker-comfyui: LTX_BOOTSTRAP set — downloading LTX weights (variant=${LTX_VARIANT:-unset})"
+    bt download_start
     if ! /download-ltx-weights.sh; then
         echo "worker-comfyui: LTX weight download FAILED — aborting boot" >&2
         exit 1
     fi
+    bt download_end
 fi
 
 # Ensure ComfyUI-Manager runs in offline network mode inside the container
 comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
 
+bt comfy_launch
 echo "worker-comfyui: Starting ComfyUI"
 
 # Allow operators to tweak verbosity; default is DEBUG.
