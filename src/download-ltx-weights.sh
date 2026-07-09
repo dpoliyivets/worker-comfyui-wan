@@ -12,11 +12,14 @@
 # with byte-range-scoped signed URLs). aria2's multi-connection byte-range
 # requests get HTTP 403 there ([[project_hf_xet_aria2_fails]]), so HF files go
 # through the **hf client** (Xet-native + hf_transfer → fast, no 403). The
-# R2-mirrored files (10Eros checkpoint + 4 NSFW LoRAs) have no Xet layer and
-# download cleanly with `aws s3 cp` (multipart-parallel). Split by LTX_VARIANT:
-# both variants pull the shared base weights + 4 LoRAs; the 22B checkpoint
-# differs (sfw → official dev-fp8 on HF, nsfw → 10Eros on R2). A sentinel skips
-# re-download on a warm container.
+# R2-mirrored 4 NSFW LoRAs (small) download cleanly with `aws s3 cp`. Split by
+# LTX_VARIANT: both variants pull the shared base weights + 4 LoRAs; the 22B
+# checkpoint differs (sfw → official dev-fp8 on HF, nsfw → 10Eros on a PRIVATE
+# HF mirror `dpoliyivets/ltx-2.3-10eros-fp8`). The 10Eros checkpoint was moved
+# off R2 → HF because R2 `aws s3 cp` ran ~17 MB/s single-stream (a 3477-part
+# multipart object), a ~28 min blocking boot that starved the cold-start window;
+# HF/Xet + hf_transfer restores parity with the fast SFW path. A sentinel skips
+# re-download on a warm container. `hf download` auths via HF_TOKEN (endpoint env).
 #
 # Required env: LTX_VARIANT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 #               R2_ENDPOINT, R2_BUCKET
@@ -69,7 +72,11 @@ if [ "$LTX_VARIANT" = "sfw" ]; then
   hf_get Lightricks/LTX-2.3-fp8 ltx-2.3-22b-dev-fp8.safetensors \
          "$MODELS/checkpoints/ltx-2.3-22b-dev-fp8.safetensors" &
 elif [ "$LTX_VARIANT" = "nsfw" ]; then
-  r2_get "ltx-checkpoints/10Eros_v1-fp8mixed_learned.safetensors" \
+  # 10Eros mirrored to a PRIVATE HF repo so it downloads via the fast Xet/hf_transfer path
+  # (~hundreds of MB/s), same as the SFW dev-fp8 checkpoint — R2 `aws s3 cp` was ~17 MB/s
+  # single-stream (a 3477-part multipart object), a ~28 min blocking boot that starved the
+  # cold-start window. `hf download` authenticates via the HF_TOKEN env set on the endpoint.
+  hf_get dpoliyivets/ltx-2.3-10eros-fp8 10Eros_v1-fp8mixed_learned.safetensors \
          "$MODELS/checkpoints/10Eros_v1-fp8mixed_learned.safetensors" &
 else
   echo "ltx-weights: LTX_VARIANT must be sfw|nsfw, got '$LTX_VARIANT'" >&2; exit 1
