@@ -698,6 +698,42 @@ def get_image_data(filename, subfolder, image_type):
 _HANDLER_IMPORT_TS = time.time()
 
 
+_GPU_NAME_CACHE = None
+
+
+def _gpu_name():
+    """GPU model serving this worker (via nvidia-smi; no torch import needed).
+    Returned in every job output so per-GPU latency/cost can be compared from
+    the render telemetry."""
+    global _GPU_NAME_CACHE
+    if _GPU_NAME_CACHE is None:
+        try:
+            import subprocess
+
+            _GPU_NAME_CACHE = (
+                subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    timeout=10,
+                )
+                .decode()
+                .strip()
+                .splitlines()[0]
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+            _GPU_NAME_CACHE = f"unknown ({exc})"
+    return _GPU_NAME_CACHE
+
+
+def _comfy_log_tail(lines=80):
+    """Last lines of ComfyUI's log (start.sh redirects it to /tmp/comfyui.log).
+    Embedded in error payloads because RunPod has no serverless log API."""
+    try:
+        with open("/tmp/comfyui.log") as f:
+            return "".join(f.readlines()[-lines:])
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never raise
+        return f"(no /tmp/comfyui.log: {exc})"
+
+
 def _boot_timing():
     info = {
         "handler_import_ts": round(_HANDLER_IMPORT_TS, 3),
@@ -747,6 +783,21 @@ def handler(job):
     job_input = job["input"]
     job_id = job.get("id") or str(uuid.uuid4())
 
+    # Log markers bracketing every job (stdout → boot.log → R2), so a failed
+    # endpoint call maps to its worker log by grepping the RunPod job id.
+    print(f"worker-comfyui - JOB-START {job_id} gpu={_gpu_name()}")
+
+    # krea-render flat-params contract: {"krea": {...}} expands into a standard
+    # workflow job (downloads the requested R2 LoRAs first, cached across warm
+    # jobs). See src/krea_workflow.py.
+    if isinstance(job_input, dict) and "krea" in job_input:
+        try:
+            from krea_workflow import expand_krea_input
+
+            job_input = expand_krea_input(job_input["krea"])
+        except Exception as exc:
+            return {"error": f"Invalid krea input: {exc}"}
+
     # Make sure that the input is valid
     validated_data, error_message = validate_input(job_input)
     if error_message:
@@ -763,7 +814,13 @@ def handler(job):
         COMFY_API_AVAILABLE_INTERVAL_MS,
     ):
         return {
-            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
+            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries.",
+            "comfy_log_tail": _comfy_log_tail(),
+            "boot_timing": _boot_timing(),
+            # ComfyUI is dead on this worker and won't come back — recycle the
+            # worker so it can't sit "ready" and instantly fail every retry
+            # (observed: one sick worker ate all 3 submitAndWait attempts).
+            "refresh_worker": True,
         }
 
     # Upload input images if they exist
@@ -1165,7 +1222,8 @@ def handler(job):
         final_result["images"] = []
 
     final_result["boot_timing"] = _boot_timing()
-    print(f"worker-comfyui - Job completed. Returning {len(output_data)} image(s).")
+    final_result["gpu_name"] = _gpu_name()
+    print(f"worker-comfyui - JOB-END {job_id}. Returning {len(output_data)} image(s).")
     return final_result
 
 

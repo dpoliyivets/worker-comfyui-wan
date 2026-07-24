@@ -1,0 +1,105 @@
+# ComfyUI Krea 2 still-render worker for RunPod Serverless — LAZY WEIGHTS
+# (downloaded at boot; same setup as Dockerfile.ltx-lazy).
+#
+# The krea-render endpoint for scene-gen v3 (spec 2026-07-24 §4): global
+# multi-region (no network volume, no region pin). The image ships WITHOUT
+# weights (~10 GB — builds and pushes anywhere, incl. locally on the Mac);
+# each worker downloads the Krea 2 set (~17.4 GB, public Comfy-Org HF repack)
+# into container disk on cold start via /download-krea-weights.sh.
+#
+# LoRAs are NEVER part of the image or the boot download: the handler pulls
+# them from R2 per job (cached across warm jobs) so Studio bundle edits need
+# no rebuild. Handler contract: {"input": {"krea": {prompt, negatives,
+# sampler, scheduler, steps, cfg, resolution{width,height}, seed,
+# loras[{source,strength}]}}} — see src/krea_workflow.py.
+#
+# Runtime env the endpoint must set:
+#   KREA_BOOTSTRAP=1
+#   R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+#
+# Build (Apple Silicon: --platform linux/amd64 is mandatory):
+#   docker build --platform linux/amd64 -f Dockerfile.krea \
+#     -t dpoliyivets1/worker-comfyui-wan:krea-<sha> .
+
+# Base aligned with the torch build below (cu128) — torch bundles its own CUDA
+# libs so only the host driver truly matters, but keeping base == wheel CUDA
+# avoids accidental toolkit/header skew for anything compiled at runtime (triton).
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE} AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_PREFER_BINARY=1
+ENV PYTHONUNBUFFERED=1
+
+# Krea loads a 12 GB fp8 transformer + 5 GB encoder on first job, and the
+# weights download first — keep the generous cold-start wait window.
+ENV COMFY_API_AVAILABLE_INTERVAL_MS=100
+ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
+
+# ComfyUI release with native Krea 2 support (krea2 CLIPLoader type + Qwen VAE
+# landed in v0.26.0; v0.28.0 is current stable at image authoring time).
+ARG COMFYUI_REF=v0.28.0
+
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
+# build-essential is REQUIRED at runtime: ComfyUI v0.28's comfy_kitchen imports
+# triton, which compiles a CUDA driver stub with the system C compiler at
+# startup — without gcc ComfyUI crashes on boot (verified from shipped worker
+# logs 2026-07-24: "Failed to find C compiler").
+RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    build-essential \
+    git \
+    wget \
+    curl \
+    unzip \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    openssh-server \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN pip install --upgrade pip setuptools wheel
+
+# PyTorch cu128: includes Blackwell sm_120 kernels. RunPod schedules Blackwell
+# hosts (RTX PRO 6000 MIG slices) into this endpoint even with 4090/A5000
+# pinned in gpuTypeIds (observed 2026-07-24), and cu124 has no sm_120 → CUDA
+# init fails and the worker crash-cycles. cu128 covers sm_86/89/120 alike.
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# ComfyUI core, pinned to a release tag with native Krea 2 nodes.
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF} \
+    && pip install -r requirements.txt
+
+# Handler deps. boto3 explicit (runtime R2 LoRA download); the hf client + Xet
+# backend do the boot weight download (Comfy-Org repos live on HF Xet storage,
+# which aria2/wget byte-range requests 403 on).
+RUN pip install runpod requests websocket-client boto3 "huggingface_hub[hf_xet]" hf_transfer
+
+ENV PIP_NO_INPUT=1
+
+# Handler + startup + the krea boot-download and flat-params expansion modules.
+WORKDIR /comfyui
+COPY src/extra_model_paths.yaml ./
+WORKDIR /
+COPY src/start.sh src/network_volume.py src/krea_workflow.py src/download-krea-weights.sh handler.py test_input.json ./
+RUN chmod +x /start.sh /download-krea-weights.sh
+COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+RUN chmod +x /usr/local/bin/comfy-manager-set-mode || true
+
+# Lean the image — no weights to shave, just build tooling + caches.
+RUN pip cache purge 2>/dev/null || true; \
+    rm -rf /comfyui/.git /root/.cache /tmp/* /var/tmp/*
+
+WORKDIR /comfyui
+CMD ["/start.sh"]

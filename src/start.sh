@@ -7,6 +7,46 @@ BOOT_TIMING=/tmp/boot-timing
 bt() { echo "$1=$(date +%s.%N)" >> "$BOOT_TIMING"; }
 : > "$BOOT_TIMING"; bt container_start
 
+# Mirror ALL of start.sh's own output to /tmp/boot.log (shipped to R2 below)
+# while keeping it on container stdout for the dashboard.
+exec > >(tee -a /tmp/boot.log) 2>&1
+
+# RunPod exposes NO serverless log API, so ship our own logs to R2 from the
+# very first moment of boot: every 20s upload boot.log + boot-timing +
+# comfyui.log (once it exists) to logs/serverless/<endpoint>/<pod-id>/.
+# Runs whenever R2 creds are on the endpoint env; failures never break boot.
+if [ -n "${R2_ENDPOINT:-}" ] && [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+    (
+        while true; do
+            python -u - <<'PYEOF' >/tmp/log-ship.err 2>&1 || true
+import os
+import boto3
+from botocore.client import Config as BotoConfig
+client = boto3.client(
+    "s3",
+    endpoint_url=os.environ["R2_ENDPOINT"],
+    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+    region_name="auto",
+    config=BotoConfig(signature_version="s3v4"),
+)
+pod = os.environ.get("RUNPOD_POD_ID", "unknown-pod")
+endpoint = os.environ.get("RUNPOD_ENDPOINT_ID", "unknown-endpoint")
+prefix = f"logs/serverless/{endpoint}/{pod}"
+for local, key in (
+    ("/tmp/boot.log", "boot.log"),
+    ("/tmp/boot-timing", "boot-timing.txt"),
+    ("/tmp/comfyui.log", "comfyui.log"),
+):
+    if os.path.exists(local):
+        client.upload_file(local, os.environ["R2_BUCKET"], f"{prefix}/{key}")
+PYEOF
+            sleep 20
+        done
+    ) &
+    echo "worker-comfyui: R2 log shipper started (logs/serverless/${RUNPOD_ENDPOINT_ID:-unknown-endpoint}/${RUNPOD_POD_ID:-unknown-pod}/)"
+fi
+
 # Start SSH server if PUBLIC_KEY is set (enables remote access and dev-sync.sh)
 if [ -n "$PUBLIC_KEY" ]; then
     mkdir -p ~/.ssh
@@ -138,6 +178,19 @@ if [ -n "$LTX_BOOTSTRAP" ]; then
     bt download_end
 fi
 
+# ---------------------------------------------------------------------------
+# Krea 2 serverless lazy-weights bootstrap — same shape as LTX_BOOTSTRAP above.
+# ---------------------------------------------------------------------------
+if [ -n "${KREA_BOOTSTRAP:-}" ]; then
+    echo "worker-comfyui: KREA_BOOTSTRAP set — downloading Krea 2 weights"
+    bt download_start
+    if ! /download-krea-weights.sh; then
+        echo "worker-comfyui: Krea weight download FAILED — aborting boot" >&2
+        exit 1
+    fi
+    bt download_end
+fi
+
 # Ensure ComfyUI-Manager runs in offline network mode inside the container
 comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
 
@@ -175,8 +228,12 @@ else
         # Sleep keeps the container alive so the orchestrator can dispatch via SSH.
         sleep infinity
     else
-        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
+        # ComfyUI output goes to /tmp/comfyui.log (handler embeds the tail in
+        # error payloads; the R2 shipper below uploads it) AND is tailed back
+        # to container stdout for the dashboard.
+        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml >> /tmp/comfyui.log 2>&1 &
         write_comfy_pid_file "$!"
+        tail -n +1 -f /tmp/comfyui.log &
 
         echo "worker-comfyui: Starting RunPod Handler"
         python -u /handler.py
