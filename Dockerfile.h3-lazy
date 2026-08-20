@@ -1,0 +1,92 @@
+# ComfyUI MiniMax H3 Worker for RunPod Serverless — LAZY WEIGHTS (downloaded at boot).
+#
+# Same shape as Dockerfile.ltx-lazy: the image ships WITHOUT weights (~10 GB,
+# builds and pushes on a stock GitHub runner) and each worker downloads its
+# variant's ~44 GB set into container disk on cold start. Baking is HARMFUL here
+# — cold start is Docker-pull-bandwidth-bound, so a bigger image is strictly
+# slower (docs/video-generation-canonical.md §12.4).
+#
+# H3 is CORE-NATIVE in ComfyUI (PR Comfy-Org/ComfyUI#15224, nodes in
+# comfy_extras/nodes_minimax_h3.py) — no custom node packs at all, unlike the LTX
+# image which needs ComfyUI-LTXVideo + RES4LYF.
+#
+# CUDA 12.8 + torch cu128, NOT the LTX image's 12.6/cu124: the H3 endpoint targets
+# RTX PRO 6000 Blackwell (sm_120), which cu124 cannot compile for, and the
+# recommended NVFP4 text encoder needs Blackwell FP4 tensor cores.
+#
+# Build:
+#   docker build -f Dockerfile.h3-lazy -t dpoliyivets1/worker-comfyui-wan:h3-lazy-<sha> .
+# Runtime env: H3_BOOTSTRAP=1, H3_VARIANT=ref2va|fl2va, H3_TEXT_ENCODER=nvfp4|int8|bf16,
+#   AWS_S3_BUCKET / AWS_S3_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#   (R2 output — a 10 s 768p clip with audio exceeds RunPod's 10/20 MB inline payload cap,
+#   so unlike LTX this worker does NOT set VIDEO_RETURN_BASE64).
+
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE} AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_PREFER_BINARY=1
+ENV PYTHONUNBUFFERED=1
+
+# handler.py cold-start wait window — H3 loads a 21 GB DiT plus a 16 GB text
+# encoder after a ~44 GB download, so keep the generous fallback.
+ENV COMFY_API_AVAILABLE_INTERVAL_MS=100
+ENV COMFY_API_AVAILABLE_MAX_RETRIES=2000
+
+# ComfyUI master @ v0.33.0 — the first line that carries the MiniMax H3 nodes
+# (EmptyMiniMaxH3LatentAV / MiniMaxH3ImageToVideo / MiniMaxH3AddGuide /
+# MiniMaxH3ReferenceToVideo / MiniMaxH3SigmaShift). Minimum supported is 0.30.0.
+ARG COMFYUI_REF=8583b0ce0a81
+
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
+RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    git \
+    wget \
+    curl \
+    unzip \
+    aria2 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    openssh-server \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN pip install --upgrade pip setuptools wheel
+
+# PyTorch cu128 — Blackwell sm_120 support (RTX PRO 6000 / 5090).
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# ComfyUI core, pinned. H3 nodes ship in core at this ref — no custom nodes.
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
+    && cd /comfyui && git checkout ${COMFYUI_REF} \
+    && pip install -r requirements.txt
+
+# Handler deps + awscli/boto3 (R2 output upload) + hf client (HF-Xet weight pulls).
+RUN pip install runpod requests websocket-client awscli boto3 "huggingface_hub[hf_xet]" hf_transfer
+
+ENV PIP_NO_INPUT=1
+
+WORKDIR /comfyui
+COPY src/extra_model_paths.yaml ./
+WORKDIR /
+COPY src/start.sh src/network_volume.py src/download-h3-weights.sh handler.py test_input.json ./
+RUN chmod +x /start.sh /download-h3-weights.sh
+COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+RUN chmod +x /usr/local/bin/comfy-manager-set-mode || true
+
+RUN pip cache purge 2>/dev/null || true; \
+    rm -rf /comfyui/.git /root/.cache /tmp/* /var/tmp/*
+
+WORKDIR /comfyui
+CMD ["/start.sh"]

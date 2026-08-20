@@ -179,6 +179,19 @@ if [ -n "$LTX_BOOTSTRAP" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MiniMax H3 serverless lazy-weights bootstrap — same shape as LTX_BOOTSTRAP above.
+# ---------------------------------------------------------------------------
+if [ -n "${H3_BOOTSTRAP:-}" ]; then
+    echo "worker-comfyui: H3_BOOTSTRAP set — downloading MiniMax H3 weights (variant=${H3_VARIANT:-unset})"
+    bt download_start
+    if ! /download-h3-weights.sh; then
+        echo "worker-comfyui: MiniMax H3 weight download FAILED — aborting boot" >&2
+        exit 1
+    fi
+    bt download_end
+fi
+
+# ---------------------------------------------------------------------------
 # Krea 2 serverless lazy-weights bootstrap — same shape as LTX_BOOTSTRAP above.
 # ---------------------------------------------------------------------------
 if [ -n "${KREA_BOOTSTRAP:-}" ]; then
