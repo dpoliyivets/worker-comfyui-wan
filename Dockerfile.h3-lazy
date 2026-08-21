@@ -80,7 +80,8 @@ ENV PIP_NO_INPUT=1
 WORKDIR /comfyui
 COPY src/extra_model_paths.yaml ./
 WORKDIR /
-COPY src/start.sh src/network_volume.py src/download-h3-weights.sh handler.py test_input.json ./
+# krea_workflow.py rides along for its ensure_loras (the per-job extra_loras r2 fetch)
+COPY src/start.sh src/network_volume.py src/krea_workflow.py src/download-h3-weights.sh handler.py test_input.json ./
 RUN chmod +x /start.sh /download-h3-weights.sh
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode || true
