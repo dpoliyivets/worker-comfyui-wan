@@ -75,6 +75,9 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
 
 # Handler deps + awscli/boto3 (R2 output upload) + hf client (HF-Xet weight pulls).
 RUN pip install runpod requests websocket-client boto3 "huggingface_hub[hf_xet]" hf_transfer
+# SageAttention (triton implementation — no nvcc needed; kernels JIT at runtime
+# via triton+gcc). Enabled per-endpoint with H3_SAGE_ATTENTION=1 (start.sh).
+RUN pip install sageattention==1.0.6
 
 ENV PIP_NO_INPUT=1
 

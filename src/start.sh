@@ -213,6 +213,14 @@ echo "worker-comfyui: Starting ComfyUI"
 # Allow operators to tweak verbosity; default is DEBUG.
 : "${COMFY_LOG_LEVEL:=DEBUG}"
 
+# Optional ComfyUI attention backend override (A/B without rebuild):
+# H3_SAGE_ATTENTION=1 on the template adds --use-sage-attention.
+COMFY_ATTN_ARGS=""
+if [ -n "${H3_SAGE_ATTENTION:-}" ]; then
+    COMFY_ATTN_ARGS="--use-sage-attention"
+    echo "worker-comfyui: SageAttention ENABLED (H3_SAGE_ATTENTION set)"
+fi
+
 COMFY_PID_FILE="/tmp/comfyui.pid"
 COMFY_PID_FILE_TMP="${COMFY_PID_FILE}.tmp"
 rm -f "$COMFY_PID_FILE" "$COMFY_PID_FILE_TMP"
@@ -225,7 +233,7 @@ write_comfy_pid_file() {
 
 # Serve the API and don't shutdown the container
 if [ "$SERVE_API_LOCALLY" == "true" ]; then
-    python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
+    python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml $COMFY_ATTN_ARGS &
     write_comfy_pid_file "$!"
 
     echo "worker-comfyui: Starting RunPod Handler"
@@ -234,7 +242,7 @@ else
     # Ephemeral mode: bind ComfyUI to 0.0.0.0 so the orchestrator can probe
     # /system_stats over the SSH relay (which exec-runs `curl localhost:8188/...`).
     if [ -n "$MANIFEST_URL" ]; then
-        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen 0.0.0.0 --port 8188 --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml &
+        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --listen 0.0.0.0 --port 8188 --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml $COMFY_ATTN_ARGS &
         write_comfy_pid_file "$!"
         echo "worker-comfyui: Ephemeral mode — sleeping forever (no serverless handler)"
         # Don't launch handler.py — there's no serverless queue feeding this pod.
@@ -244,7 +252,7 @@ else
         # ComfyUI output goes to /tmp/comfyui.log (handler embeds the tail in
         # error payloads; the R2 shipper below uploads it) AND is tailed back
         # to container stdout for the dashboard.
-        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml >> /tmp/comfyui.log 2>&1 &
+        python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout --extra-model-paths-config /comfyui/extra_model_paths.yaml $COMFY_ATTN_ARGS >> /tmp/comfyui.log 2>&1 &
         write_comfy_pid_file "$!"
         tail -n +1 -f /tmp/comfyui.log &
 
