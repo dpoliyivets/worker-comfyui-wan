@@ -803,6 +803,20 @@ def handler(job):
     if error_message:
         return {"error": error_message}
 
+    # Per-job conditional LoRAs: `extra_loras` is a list of {"source": "r2://<key>"}
+    # objects fetched into ComfyUI's lora dir before the workflow queues (cached
+    # across warm jobs). Reuses the krea path's ensure_loras, which rejects any
+    # non-r2:// source so a compromised job cannot pull attacker weights.
+    extra_loras = job_input.get("extra_loras") if isinstance(job_input, dict) else None
+    if extra_loras:
+        try:
+            from krea_workflow import ensure_loras
+
+            fetched = ensure_loras(extra_loras)
+            print(f"worker-comfyui - extra_loras ready: {fetched}")
+        except Exception as exc:
+            return {"error": f"Failed to fetch extra_loras: {exc}"}
+
     # Extract validated data
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
