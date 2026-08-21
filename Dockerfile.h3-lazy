@@ -64,8 +64,10 @@ RUN python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 RUN pip install --upgrade pip setuptools wheel
 
-# PyTorch cu128 — Blackwell sm_120 support (RTX PRO 6000 / 5090).
-RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# PyTorch cu130 — Blackwell sm_120 support AND comfy_kitchen's optimized triton/cuda
+# quant kernels (int8_linear / nvfp4), which refuse to enable on cu128 and fall back
+# to eager (measured: "Backend eager selected for int8_linear" spam during sampling).
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 # ComfyUI core, pinned. H3 nodes ship in core at this ref — no custom nodes.
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /comfyui \
