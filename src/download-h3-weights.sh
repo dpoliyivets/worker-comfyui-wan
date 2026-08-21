@@ -29,6 +29,9 @@ set -euo pipefail
 : "${H3_VARIANT:?H3_VARIANT must be ref2va|fl2va}"
 : "${H3_TEXT_ENCODER:=nvfp4}"
 
+# HF_XET_HIGH_PERFORMANCE is the current switch; the old HF_TRANSFER var stays for
+# hub versions that still read it (newer ones just FutureWarn on it).
+export HF_XET_HIGH_PERFORMANCE=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 MODELS_DIR=/comfyui/models

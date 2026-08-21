@@ -1237,6 +1237,9 @@ def handler(job):
 
     final_result["boot_timing"] = _boot_timing()
     final_result["gpu_name"] = _gpu_name()
+    # Worker-truth build identity (baked at image build) so perf measurements
+    # attribute to the image that ACTUALLY ran, not the template's current tag.
+    final_result["image_tag"] = os.environ.get("IMAGE_TAG", "unknown")
     print(f"worker-comfyui - JOB-END {job_id}. Returning {len(output_data)} image(s).")
     return final_result
 

@@ -51,6 +51,8 @@ jobs:
           file: Dockerfile.h3-lazy
           push: true
           tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            IMAGE_TAG=${{ steps.meta.outputs.image }}
 
       - name: Print pushed image
         run: echo "Pushed ${{ steps.meta.outputs.image }}"
